@@ -564,8 +564,1403 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
 <!-- TOAST -->
 <div class="toast" id="toast"></div>
 
-<script src="app.js"></script>
 <script>
+'use strict';
+
+/* ─────────────────────────────────────────
+   GENRE MAP  Discogs styles → shop cats
+───────────────────────────────────────── */
+const GM = {
+  'House':'House','Deep House':'Deep House','Chicago House':'Chicago House',
+  'Soulful House':'Soulful House','Vocal House':'Vocal House',
+  'Funky House':'Funky House','Afro House':'Afro House',
+  'Latin House':'Latin House','Disco House':'Disco House',
+  'Garage House':'Garage House','UK Garage':'UK Garage',
+  '2-Step':'UK Garage','Speed Garage':'UK Garage',
+  'Techno':'Techno','Detroit Techno':'Detroit Techno',
+  'Industrial':'Industrial','Minimal':'Minimal',
+  'Minimal Techno':'Minimal','Schranz':'Hard Techno',
+  'Hard Techno':'Hard Techno','Acid':'Acid',
+  'Acid House':'Acid House','Acid Techno':'Acid',
+  'Trance':'Trance','Progressive Trance':'Progressive Trance',
+  'Tech House':'Tech House','Electro House':'Electro House',
+  'Electro':'Electro','Electroclash':'Electro',
+  'EBM':'EBM','Industrial Techno':'Industrial',
+  'Noise':'Industrial','Ambient':'Ambient',
+  'Ambient Techno':'Ambient','Drone':'Ambient',
+  'Experimental':'Experimental','Drum n Bass':'Drum & Bass',
+  'Jungle':'Jungle','Hardcore':'Hardcore','Gabber':'Hardcore',
+  'Breakbeat':'Breakbeat','Breaks':'Breakbeat','Big Beat':'Breakbeat',
+  'Progressive House':'Progressive House','Dub Techno':'Dub Techno',
+  'Dub':'Dub','Italo House':'Italo House','Euro House':'Italo House',
+  'Hi NRG':'Hi-NRG','Eurodance':'Hi-NRG','Leftfield':'Leftfield',
+  'Downtempo':'Downtempo','IDM':'IDM','New Beat':'New Beat',
+  'Chicago Techno':'Techno','UK Techno':'Techno',
+};
+const SKIP_GENRES = new Set(['Electronic','Pop','Rock','Classical','Jazz','Folk, World, & Country','Funk / Soul','Hip Hop','Reggae','Blues','Non-Music','Stage & Screen',"Children's",'Brass & Military','Latin']);
+
+function mapGenres(genres, styles) {
+  const out = new Set();
+  for (const s of (styles || [])) { if (GM[s]) out.add(GM[s]); }
+  for (const g of (genres || [])) { if (GM[g]) out.add(GM[g]); }
+  if (!out.size) { for (const s of (styles || [])) { if (s && !SKIP_GENRES.has(s)) out.add(s); } }
+  if (!out.size) { for (const g of (genres || [])) { if (g && !SKIP_GENRES.has(g)) out.add(g); } }
+  if (!out.size) { for (const g of [...(genres || []), ...(styles || [])].slice(0, 2)) { if (g) out.add(g); } }
+  return [...out];
+}
+
+/* ─────────────────────────────────────────
+   INDEXEDDB
+───────────────────────────────────────── */
+const DB = (() => {
+  let _db = null;
+  function open() {
+    if (_db) return Promise.resolve(_db);
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('VinylVault', 2);
+      r.onupgradeneeded = e => {
+        const d = e.target.result;
+        if (!d.objectStoreNames.contains('records')) {
+          const s = d.createObjectStore('records', { keyPath: 'id' });
+          s.createIndex('artist', 'artist', { unique: false });
+          s.createIndex('added_date', 'added_date', { unique: false });
+          s.createIndex('discogs_id', 'discogs_id', { unique: false });
+        }
+        if (!d.objectStoreNames.contains('settings'))
+          d.createObjectStore('settings', { keyPath: 'key' });
+        if (d.objectStoreNames.contains('queue'))
+          d.deleteObjectStore('queue');
+      };
+      r.onsuccess = e => { _db = e.target.result; res(_db); };
+      r.onerror = () => rej(r.error);
+    });
+  }
+  function txOp(store, mode, fn) {
+    return open().then(d => new Promise((res, rej) => {
+      const t = d.transaction(store, mode);
+      const s = t.objectStore(store);
+      const r = fn(s);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    }));
+  }
+  function getAll(store) {
+    return open().then(d => new Promise((res, rej) => {
+      const t = d.transaction(store, 'readonly');
+      const r = t.objectStore(store).getAll();
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    }));
+  }
+  return {
+    put: r => txOp('records', 'readwrite', s => s.put(r)),
+    del: id => txOp('records', 'readwrite', s => s.delete(id)),
+    all: () => getAll('records'),
+    count: () => open().then(d => new Promise((res, rej) => {
+      const r = d.transaction('records', 'readonly').objectStore('records').count();
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    })),
+    getSetting: key => txOp('settings', 'readonly', s => s.get(key)).then(r => r ? r.v : null).catch(() => null),
+    setSetting: (key, v) => txOp('settings', 'readwrite', s => s.put({ key, v })),
+  };
+})();
+
+/* ─────────────────────────────────────────
+   DISCOGS API
+───────────────────────────────────────── */
+let _searchAbort = false;
+
+const Discogs = (() => {
+  const BASE = 'https://api.discogs.com';
+  let last = 0; const GAP = 1300;
+  const sym = { GBP: '£', USD: '$', EUR: '€', AUD: 'A$', CAD: 'C$' };
+  function wait() {
+    const n = Date.now(), d = GAP - (n - last);
+    if (d > 0) return new Promise(r => setTimeout(r, d));
+    return Promise.resolve();
+  }
+  async function get(path) {
+    await wait(); last = Date.now();
+    const hdrs = { 'Accept': 'application/json' };
+    const tok = App.set.token;
+    if (tok) hdrs['Authorization'] = `Discogs token=${tok}`;
+    const r = await fetch(BASE + path, { headers: hdrs });
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.json();
+  }
+  return {
+    rawGet: get,
+    release: id => get(`/releases/${id}`),
+    search: async q => (await Discogs.searchWithFallback(q)).results,
+    searchArtist: artist => get(`/database/search?artist=${encodeURIComponent(artist)}&type=release&per_page=25&format=vinyl`).then(d => d.results || []),
+    stats: id => get(`/marketplace/stats/${id}`).catch(() => null),
+    searchWithFallback: async q => {
+      progShow();
+      const collapsed = collapseSpellOut(q);
+      const canonical = (collapsed || q).trim();
+      const tryQ = async (url) => {
+        if (_searchAbort) return [];
+        return get(url).then(d => d.results || []).catch(() => []);
+      };
+      function wordCombos(words, minLen = 3) {
+        const combos = [];
+        for (let len = words.length; len >= minLen; len--) {
+          for (let start = 0; start <= words.length - len; start++) {
+            combos.push(words.slice(start, start + len).join(' '));
+          }
+        }
+        return [...new Set(combos)];
+      }
+      function addJoins(words) {
+        const extra = new Set();
+        for (let i = 0; i < words.length - 1; i++) {
+          const joined = [...words];
+          joined.splice(i, 2, words[i] + words[i + 1]);
+          extra.add(joined.join(' '));
+        }
+        return [...extra];
+      }
+      const words = canonical.split(/\s+/).filter(Boolean);
+      if (looksLikeCatNo(canonical)) {
+        progStep(1, `Cat# search "${canonical}"…`);
+        for (const cat of [...new Set([
+          canonical.replace(/\s+/g, '').toUpperCase(),
+          canonical,
+          ...catVariants(canonical),
+        ])]) {
+          if (_searchAbort) { progHide(); return { results: [], usedQuery: null }; }
+          const r = await tryQ(`/database/search?catno=${encodeURIComponent(cat)}&type=release&per_page=15&format=vinyl`);
+          if (r.length) { progHide(); return { results: r, usedQuery: collapsed ? canonical : null }; }
+        }
+      }
+      progStep(1, `Searching "${canonical}"…`);
+      const fullVariants = [canonical, ...addJoins(words), ...catVariants(canonical)];
+      if (collapsed) fullVariants.push(q, ...addJoins(q.split(/\s+/).filter(Boolean)));
+      for (const v of [...new Set(fullVariants)]) {
+        if (_searchAbort) { progHide(); return { results: [], usedQuery: null }; }
+        const r = await tryQ(`/database/search?q=${encodeURIComponent(v)}&type=release&per_page=15&format=vinyl`);
+        if (r.length) { progHide(); return { results: r, usedQuery: v !== q ? v : null }; }
+      }
+      if (words.length > 3) {
+        progStep(2, 'Trying shorter phrases…');
+        const combos = wordCombos(words, Math.min(3, words.length - 1));
+        for (const combo of combos) {
+          if (_searchAbort) { progHide(); return { results: [], usedQuery: null }; }
+          const joinsOfCombo = addJoins(combo.split(' '));
+          for (const v of [combo, ...joinsOfCombo]) {
+            if (_searchAbort) { progHide(); return { results: [], usedQuery: null }; }
+            const r = await tryQ(`/database/search?q=${encodeURIComponent(v)}&type=release&per_page=15&format=vinyl`);
+            if (r.length) { progHide(); return { results: r, usedQuery: v }; }
+          }
+        }
+      }
+      progStep(2, 'Broad fallback…');
+      const sigWords = [...words].sort((a, b) => b.length - a.length).slice(0, 2);
+      if (sigWords.length) {
+        const r = await tryQ(`/database/search?q=${encodeURIComponent(sigWords.join(' '))}&type=release&per_page=15&format=vinyl`);
+        progHide();
+        return { results: r, usedQuery: r.length ? sigWords.join(' ') : null };
+      }
+      progHide();
+      return { results: [], usedQuery: null };
+    },
+    fmt: (v, c) => {
+      if (v == null || v === '' || isNaN(v)) return null;
+      const s = sym[c] || c + ' ';
+      return `${s}${parseFloat(v).toFixed(2)}`;
+    }
+  };
+})();
+
+/* ─────────────────────────────────────────
+   VOICE / AU CLEANUP
+───────────────────────────────────────── */
+const AU_FIXES = [
+  [/\b00\b/g, 'zero zero'], [/\b0\b/g, 'zero'],
+  [/\b1\b(?!\s*\d)/g, 'one'], [/\b2\b(?!\s*\d)/g, 'two'],
+  [/\b3\b(?!\s*\d)/g, 'three'], [/\b4\b(?!\s*\d)/g, 'four'],
+  [/\b5\b(?!\s*\d)/g, 'five'], [/\b6\b(?!\s*\d)/g, 'six'],
+  [/\b7\b(?!\s*\d)/g, 'seven'], [/\b8\b(?!\s*\d)/g, 'eight'],
+  [/\b9\b(?!\s*\d)/g, 'nine'],
+  [/\beffects\b/gi, 'Aphex'], [/\bafflicts\b/gi, 'Aphex'],
+  [/\bunder ground\b/gi, 'Underground'], [/\bunder water\b/gi, 'Underwater'],
+  [/\bauto mat\b/gi, 'Automat'], [/\bread ee\b/gi, 'Rädï'],
+  [/\bde tree it\b/gi, 'Detroit'], [/\bde troit\b/gi, 'Detroit'],
+  [/\bstab el\b/gi, 'Stabel'], [/\bclash tic\b/gi, 'Clashtic'],
+  [/\bork ell\b/gi, 'Orcal'], [/\bwax tract\b/gi, 'Wax Trax'],
+  [/\btrax\b/gi, 'Trax'], [/\bbleep\b/gi, 'Bleep'],
+  [/\bmus ex\b/gi, 'Musex'], [/\bmuse x\b/gi, 'Musex'],
+  [/\bjew el\b/gi, 'Jewel'], [/\bleft field\b/gi, 'Leftfield'],
+  [/\bover drive\b/gi, 'Overdrive'], [/\bsub merge\b/gi, 'Submerge'],
+  [/\brhyme\b/gi, 'Rhythim'], [/\bright-ism\b/gi, 'Rhythim'],
+  [/\bkraft work\b/gi, 'Kraftwerk'], [/\bcraft work\b/gi, 'Kraftwerk'],
+  [/\bcraft ward\b/gi, 'Kraftwerk'], [/\bwarp\b/gi, 'Warp'],
+  [/\bworped\b/gi, 'Warp'], [/\bmut\b/gi, 'Mute'],
+  [/\bclone\b/gi, 'Clone'], [/\bklon\b/gi, 'Clone'],
+];
+function auClean(t) {
+  let s = t;
+  for (const [pat, rep] of AU_FIXES) s = s.replace(pat, rep);
+  return s.trim();
+}
+
+/* ─────────────────────────────────────────
+   HOMOPHONE MAP  (spoken variant → canonical + all alternates)
+   Used to generate retry queries when search returns 0 results.
+───────────────────────────────────────── */
+// Each entry: [canonical, ...alternates]
+// We build a lookup so any variant → full group
+const HOMOPHONE_GROUPS = [
+  // Numbers
+  ['4','four','for','fore'],
+  ['2','two','to','too'],
+  ['8','eight','ate'],
+  ['1','one','won'],
+  ['3','three','free'],
+  ['6','six','sex'],
+  ['7','seven','heaven'],
+  ['0','zero','oh'],
+  ['5','five'],
+  ['9','nine'],
+  ['10','ten'],
+  // Classic English
+  ['allowed','aloud'],
+  ['there','their',"they're",'theyre'],
+  ['your',"you're",'youre'],
+  ['its',"it's",'its'],
+  ['by','bye','buy'],
+  ['hear','here'],
+  ['know','no'],
+  ['new','knew','gnu'],
+  ['right','write','rite'],
+  ['soul','sole'],
+  ['sun','son'],
+  ['break','brake'],
+  ['blue','blew'],
+  ['meet','meat'],
+  ['rain','reign','rein'],
+  ['real','reel'],
+  ['road','rode'],
+  ['scene','seen'],
+  ['steel','steal'],
+  ['wait','weight'],
+  ['wear','where','ware'],
+  ['week','weak'],
+  ['whole','hole'],
+  ['wood','would'],
+  ['see','sea'],
+  ['night','knight'],
+  ['flower','flour'],
+  ['not','knot'],
+  ['plane','plain'],
+  ['piece','peace'],
+  ['pair','pear','pare'],
+  ['male','mail'],
+  ['fare','fair'],
+  ['hair','hare'],
+  ['heel','heal'],
+  ['led','lead'],
+  ['loan','lone'],
+  ['morning','mourning'],
+  ['passed','past'],
+  ['principal','principle'],
+  ['profit','prophet'],
+  ['scent','sent','cent'],
+  ['sight','site','cite'],
+  ['soar','sore'],
+  ['some','sum'],
+  ['stair','stare'],
+  ['sweet','suite'],
+  ['thrown','throne'],
+  ['tied','tide'],
+  ['vale','veil'],
+  ['war','wore'],
+  ['way','weigh','whey'],
+  ['which','witch'],
+  ['whine','wine'],
+  ['bare','bear'],
+  ['tail','tale'],
+  ['made','maid'],
+  ['route','root'],
+];
+
+// Build fast lookup: word → sibling variants
+const HOMOPHONE_MAP = new Map();
+for (const group of HOMOPHONE_GROUPS) {
+  for (const word of group) {
+    HOMOPHONE_MAP.set(word.toLowerCase(), group.filter(w => w.toLowerCase() !== word.toLowerCase()));
+  }
+}
+
+/** Generate alternate query strings by swapping homophones one at a time */
+function homophoneVariants(q) {
+  const tokens = q.trim().split(/\s+/);
+  const variants = new Set();
+  tokens.forEach((tok, idx) => {
+    const key = tok.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const alts = HOMOPHONE_MAP.get(key);
+    if (!alts) return;
+    for (const alt of alts) {
+      const copy = [...tokens];
+      copy[idx] = alt;
+      variants.add(copy.join(' '));
+    }
+  });
+  return [...variants];
+}
+
+/** Google Lens launcher */
+function openGoogleLens() {
+  // Try native URI (Android); fall back to lens.google.com after short delay
+  let opened = false;
+  const handler = () => { opened = true; };
+  window.addEventListener('blur', handler, { once: true });
+  const iframe = document.createElement('iframe');
+  iframe.style.display = 'none';
+  iframe.src = 'googlelens://';
+  document.body.appendChild(iframe);
+  setTimeout(() => {
+    document.body.removeChild(iframe);
+    window.removeEventListener('blur', handler);
+    if (!opened) window.open('https://lens.google.com', '_blank');
+  }, 1200);
+}
+
+/* ─────────────────────────────────────────
+   SEARCH PROGRESS POPUP
+───────────────────────────────────────── */
+let _progTimer = null;
+function progShow() {
+  _searchAbort = false;
+  document.getElementById('srch-progress').classList.add('on');
+  document.getElementById('srch-progress-backdrop').classList.add('on');
+  ['sp-1', 'sp-2', 'sp-3'].forEach(id => { document.getElementById(id).className = 'sp-step'; });
+}
+function progStep(n, label) {
+  for (let i = 1; i < n; i++) {
+    const el = document.getElementById(`sp-${i}`);
+    if (el) el.className = 'sp-step done';
+  }
+  const el = document.getElementById(`sp-${n}`);
+  if (el) {
+    el.className = 'sp-step active';
+    if (label) el.querySelector('.sp-txt').textContent = label;
+  }
+}
+function progHide() {
+  clearTimeout(_progTimer);
+  _progTimer = setTimeout(() => {
+    document.getElementById('srch-progress').classList.remove('on');
+    document.getElementById('srch-progress-backdrop').classList.remove('on');
+    ['sp-1', 'sp-2', 'sp-3'].forEach(id => { const el = document.getElementById(id); if (el) el.className = 'sp-step'; });
+  }, 500);
+}
+
+/* ─────────────────────────────────────────
+   NUMBER / WORD VARIANTS
+───────────────────────────────────────── */
+const NUM_WORDS = {
+  '0': 'zero', '1': 'one', '2': 'two', '3': 'three', '4': 'four',
+  '5': 'five', '6': 'six', '7': 'seven', '8': 'eight', '9': 'nine',
+  '10': 'ten', '11': 'eleven', '12': 'twelve', '13': 'thirteen', '14': 'fourteen',
+  '15': 'fifteen', '16': 'sixteen', '17': 'seventeen', '18': 'eighteen', '19': 'nineteen',
+  '20': 'twenty', '21': 'twenty one', '22': 'twenty two', '30': 'thirty', '40': 'forty',
+  '50': 'fifty', '60': 'sixty', '70': 'seventy', '80': 'eighty', '90': 'ninety',
+  '00': 'double zero', '100': 'one hundred',
+};
+const WORD_NUMS = Object.fromEntries(Object.entries(NUM_WORDS).map(([n, w]) => [w, n]));
+
+const ENDING_SWAPS = [
+  ['ed', 'er'], ['er', 'ed'], ['oon', 'on'], ['on', 'oon'],
+  ['ed', 'd'], ['d', 'ed'], ['er', 'a'], ['a', 'er'],
+  ['ie', 'y'], ['y', 'ie'], ['ck', 'k'], ['k', 'ck'],
+  ['s', 'z'], ['z', 's'],
+];
+
+function collapseSpellOut(q) {
+  const tokens = q.trim().split(/\s+/);
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (run.length >= 3) out.push(run.join('').toUpperCase());
+    else out.push(...run);
+    run = [];
+  };
+  for (const t of tokens) {
+    if (t.length === 1) run.push(t);
+    else { flush(); out.push(t); }
+  }
+  flush();
+  const collapsed = out.join(' ');
+  return collapsed === q ? null : collapsed;
+}
+
+function looksLikeCatNo(q) {
+  return /\b[A-Z]{1,6}[-\s]?\d{1,6}\b/i.test(q);
+}
+
+function catVariants(q) {
+  const vars = new Set([q]);
+  const joined = q.replace(/\b([A-Za-z]{1,6})\s+(\d{1,6})\b/g, '$1$2')
+    .replace(/\b(\d{1,6})\s+([A-Za-z]{1,6})\b/g, '$1$2');
+  if (joined !== q) vars.add(joined);
+  const split = q.replace(/\b([A-Za-z]{1,6})(\d{1,6})\b/g, '$1 $2')
+    .replace(/\b(\d{1,6})([A-Za-z]{1,6})\b/g, '$1 $2');
+  if (split !== q) vars.add(split);
+  const dashed = q.replace(/\b([A-Za-z]{1,6})\s*(\d{1,6})\b/g, '$1-$2');
+  if (dashed !== q) vars.add(dashed);
+  const undashed = q.replace(/\b([A-Za-z]{1,6})-(\d{1,6})\b/g, '$1$2')
+    .replace(/\b([A-Za-z]{1,6})-(\d{1,6})\b/g, '$1 $2');
+  if (undashed !== q) vars.add(undashed);
+  const upped = q.replace(/\b([A-Za-z]{1,6})(\s*[-\s]?\s*)(\d{1,6})\b/g,
+    (m, l, sep, n) => l.toUpperCase() + sep + n);
+  if (upped !== q) vars.add(upped);
+  return [...vars];
+}
+
+/* ─────────────────────────────────────────
+   VOICE
+───────────────────────────────────────── */
+const Voice = (() => {
+  let rec = null, going = false, _mode = 'search';
+  // Active button element for animation
+  function _getBtn() {
+    return _mode === 'cat'
+      ? document.getElementById('micBtnCat')
+      : document.getElementById('micBtnSearch');
+  }
+  function init() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return;
+    rec = new SR();
+    rec.continuous = false;
+    rec.interimResults = true;
+    rec.lang = 'en-AU';
+    rec.maxAlternatives = 3;
+    rec.onstart = () => {
+      going = true;
+      document.getElementById('mw').classList.add('go');
+      _getBtn()?.classList.add('go');
+      setTx(_mode === 'cat' ? 'Listening for Cat# / Matrix…' : 'Listening…', false);
+    };
+    rec.onresult = e => {
+      const last = e.results[e.results.length - 1];
+      const best = Array.from(last).sort((a, b) => b.confidence - a.confidence)[0];
+      const interim = Array.from(e.results).slice(0, -1).map(r => r[0].transcript).join(' ');
+      const t = (interim + ' ' + best.transcript).trim();
+      const fin = last.isFinal;
+      setTx(t, fin ? false : 'live');
+      if (fin) {
+        if (_mode === 'cat') App.searchCatNo(t);
+        else App.search(auClean(t));
+      }
+    };
+    rec.onerror = e => {
+      going = false;
+      document.getElementById('mw').classList.remove('go');
+      _getBtn()?.classList.remove('go');
+      if (e.error === 'not-allowed') toast('Mic permission denied', 'er');
+      else if (e.error === 'language-not-supported') { rec.lang = 'en-US'; toast('Switched to en-US fallback', 'er'); }
+      else if (e.error !== 'no-speech') toast('Speech error: ' + e.error, 'er');
+      setTx('Ready to listen…', false);
+    };
+    rec.onend = () => {
+      going = false;
+      document.getElementById('mw').classList.remove('go');
+      _getBtn()?.classList.remove('go');
+    };
+  }
+  return {
+    toggle(mode = 'search') {
+      if (!rec) init();
+      if (!rec) { toast('Voice not supported in this browser', 'er'); return; }
+      if (going && _mode === mode) { try { rec.stop(); } catch (e) { } return; }
+      if (going) { try { rec.stop(); } catch (e) { } }
+      _mode = mode;
+      setTimeout(() => { try { rec.start(); } catch (e) { } }, going ? 200 : 0);
+    },
+    ok: () => !!(window.SpeechRecognition || window.webkitSpeechRecognition)
+  };
+})();
+
+/* ─────────────────────────────────────────
+   HELPERS
+───────────────────────────────────────── */
+function esc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function uid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+function slug(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100);
+}
+function setTx(t, state) {
+  const el = document.getElementById('tx');
+  el.textContent = t;
+  el.className = 'transcript' + (state === 'live' ? ' live' : state === 'results' ? ' has-results' : '');
+}
+function showDisc(on) {
+  document.getElementById('disc').classList.toggle('on', on);
+}
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.className = `toast ${type} show`;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove('show'), 2800);
+}
+function openModal(id) { document.getElementById(id).classList.add('on'); }
+function closeModal(id) { document.getElementById(id).classList.remove('on'); }
+function resetCfModal() {
+  document.getElementById('cf-title').textContent = 'Confirm & Add';
+  document.getElementById('cf-foot').style.display = '';
+  document.getElementById('cf-back').style.display = 'none';
+}
+function imgErr(el, cls) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = '💿';
+  el.parentNode && el.parentNode.replaceChild(d, el);
+}
+function imgEl(src, cls, alt) {
+  if (!src) return `<div class="${cls}">💿</div>`;
+  return `<img class="${cls}" src="${esc(src)}" alt="${esc(alt || '')}" loading="lazy" onerror="imgErr(this,'${cls}')">`;
+}
+function fmtPrice(price, cur) {
+  return Discogs.fmt(price, cur || App.set.cur || 'USD') || '—';
+}
+function sellFmt(v) {
+  if (v == null || isNaN(v)) return '—';
+  return '$' + Math.ceil(Number(v));
+}
+function medFmt(v) {
+  if (v == null || isNaN(v)) return '—';
+  return '$' + parseFloat(v).toFixed(2);
+}
+function fileStamp(count) {
+  const now = new Date();
+  const day = now.getDate();
+  const mon = now.toLocaleString('en', { month: 'short' }).toLowerCase();
+  let h = now.getHours();
+  const ampm = h >= 12 ? 'pm' : 'am';
+  h = h % 12 || 12;
+  return `VinylVault-${day}${mon}${h}${ampm}-${count}scan${count !== 1 ? 's' : ''}`;
+}
+
+/* ─────────────────────────────────────────
+   CSV EXPORT
+───────────────────────────────────────── */
+const Exp = {
+  async shopify() {
+    const recs = await DB.all();
+    if (!recs.length) { toast('No records to export', 'er'); return; }
+    const vend = App.set.shopName || 'Vinyl Shop';
+    const hdr = ['Handle', 'Title', 'Body (HTML)', 'Vendor', 'Type', 'Tags', 'Published',
+      'Option1 Name', 'Option1 Value', 'Variant SKU', 'Variant Inventory Qty',
+      'Variant Price', 'Variant Requires Shipping', 'Variant Taxable',
+      'Image Src', 'Image Alt Text', 'Country of Origin', 'Status'];
+    const rows = recs.map(r => {
+      const handle = slug(`${r.artist} ${r.title}`);
+      const title = `${r.artist} – ${r.title}`;
+      const tags = [...(r.genres || []), r.format?.split(' — ')[0] || '', r.year || '', r.label || '', r.cat_no || ''].filter(Boolean).join(', ');
+      const tl = r.tracklist ? `<p><strong>Tracklist:</strong><br>${r.tracklist.replace(/\n/g, '<br>')}</p>` : '';
+      const body = `<p>${esc(r.artist)} — <strong>${esc(r.title)}</strong></p><p>Label: ${esc(r.label || '—')} | Cat#: ${esc(r.cat_no || '—')} | Year: ${esc(String(r.year || '—'))} | Country: ${esc(r.country || '—')}</p><p>Format: ${esc(r.format || 'Vinyl')}</p>${tl}<p><a href="${esc(r.discogs_url || '')}">View on Discogs</a></p>`;
+      const price = r.sell_price != null ? String(r.sell_price) : '';
+      const sku = `VV-${(r.discogs_id || uid()).toString().slice(0, 10).toUpperCase()}`;
+      const fmt = r.format?.split(' — ')[0] || 'Vinyl';
+      return [handle, title, body, vend, 'Vinyl Record', tags, 'true', 'Format', fmt, sku, '1', price, 'true', 'false', r.cover_image || '', title, r.country || '', 'active'];
+    });
+    dlCSV([hdr, ...rows], `${fileStamp(recs.length)}-shopify.csv`);
+    toast(`${recs.length} records → Shopify CSV`);
+  },
+  async discogs() {
+    const recs = await DB.all();
+    if (!recs.length) { toast('No records to export', 'er'); return; }
+    const cond = App.set.cond || 'VG+';
+    const hdr = ['release_id', 'qty', 'condition', 'sleeve_condition', 'price', 'comments', 'allow_offers', 'status', 'location', 'country'];
+    const rows = recs.map(r => [
+      r.discogs_id || '', 1, cond, cond,
+      r.sell_price != null ? String(r.sell_price) : '',
+      r.notes || '', 0, 'For Sale', '', r.country || ''
+    ]);
+    dlCSV([hdr, ...rows], `${fileStamp(recs.length)}-discogs.csv`);
+    toast(`${recs.length} records → Discogs CSV`);
+  },
+  async json() {
+    const recs = await DB.all();
+    if (!recs.length) { toast('No records to export', 'er'); return; }
+    const blob = new Blob([JSON.stringify({ version: 2, exported: new Date().toISOString(), records: recs }, null, 2)], { type: 'application/json' });
+    dlBlob(blob, `${fileStamp(recs.length)}.json`);
+    toast(`Backed up ${recs.length} records`);
+  },
+  async restore(inp) {
+    const f = inp.files[0]; if (!f) return;
+    try {
+      const txt = await f.text();
+      const data = JSON.parse(txt);
+      const recs = data.records || data;
+      if (!Array.isArray(recs)) throw new Error('Invalid format');
+      let n = 0;
+      for (const r of recs) { if (r.id && r.title) { await DB.put(r); n++; } }
+      toast(`Restored ${n} records`);
+      App.refresh();
+    } catch (e) { toast('Restore failed: ' + e.message, 'er'); }
+    inp.value = '';
+  }
+};
+
+function dlCSV(rows, name) {
+  const csv = rows.map(r => r.map(c => {
+    const s = String(c ?? '');
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(',')).join('\r\n');
+  dlBlob(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }), name);
+}
+function dlBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+/* ─────────────────────────────────────────
+   MAIN APP
+───────────────────────────────────────── */
+const App = {
+  set: { token: '', shopName: '', cur: 'USD', cond: 'VG+' },
+  view: 'home',
+  recs: [],
+  filtered: [],
+  page: 0, PAGE: 50,
+  genreF: '',
+  cache: [],
+  pending: null,
+
+  async init() {
+    this._bindEvents();
+    await this.loadSet();
+    await this.refresh();
+    document.getElementById('tk').value = this.set.token || '';
+    document.getElementById('shopn').value = this.set.shopName || '';
+    document.getElementById('cond').value = this.set.cond || 'VG+';
+  },
+
+  _bindEvents() {
+    // Logo
+    document.getElementById('logo-btn').addEventListener('click', () => this.logoRefresh());
+
+    // Nav buttons
+    document.getElementById('nav-home').addEventListener('click', () => this.nav('home'));
+    document.getElementById('nav-inv').addEventListener('click', () => this.nav('inv'));
+    document.getElementById('nav-exp').addEventListener('click', () => this.nav('exp'));
+    document.getElementById('nav-set').addEventListener('click', () => this.nav('set'));
+
+    // Dual Mic buttons
+    document.getElementById('micBtnCat')?.addEventListener('click', () => Voice.toggle('cat'));
+    document.getElementById('micBtnSearch')?.addEventListener('click', () => Voice.toggle('search'));
+
+    // Google Lens button
+    document.getElementById('lens-btn')?.addEventListener('click', () => openGoogleLens());
+
+    // Transcript — reopen results
+    document.getElementById('tx').addEventListener('click', () => this.reopenResults());
+
+    // Home search
+    const homeSearch = document.getElementById('home-search');
+    homeSearch.addEventListener('keydown', e => { if (e.key === 'Enter') { this.search(homeSearch.value); homeSearch.blur(); } });
+    document.getElementById('home-go-btn').addEventListener('click', () => this.search(homeSearch.value));
+
+    // Inventory search
+    document.getElementById('inv-q').addEventListener('input', () => this.filter());
+
+    // Export buttons
+    document.getElementById('btn-shopify').addEventListener('click', () => Exp.shopify());
+    document.getElementById('btn-discogs').addEventListener('click', () => Exp.discogs());
+    document.getElementById('btn-json').addEventListener('click', () => Exp.json());
+    document.getElementById('restore-file').addEventListener('change', function () { Exp.restore(this); });
+
+    // Settings
+    document.getElementById('tk').addEventListener('keydown', e => { if (e.key === 'Enter') { this.saveSetConfirm(); e.target.blur(); } });
+    document.getElementById('btn-save-token').addEventListener('click', () => this.saveSetConfirm());
+    document.getElementById('shopn').addEventListener('blur', () => this.saveSet());
+    document.getElementById('shopn').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+    document.getElementById('cond').addEventListener('blur', () => this.saveSet());
+    document.getElementById('cond').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+    document.getElementById('btn-clear-all').addEventListener('click', () => this.clearAll());
+
+    // Results modal
+    document.getElementById('res-close').addEventListener('click', () => closeModal('res-ov'));
+    document.getElementById('res-mic').addEventListener('click', () => this.resMic());
+    const resRefine = document.getElementById('res-refine');
+    resRefine.addEventListener('keydown', e => { if (e.key === 'Enter') { this.refineSearch(resRefine.value); resRefine.blur(); } });
+    document.getElementById('res-go-btn').addEventListener('click', () => this.refineSearch(resRefine.value));
+    document.getElementById('res-filter').addEventListener('input', e => this.filterResults(e.target.value));
+
+    // Confirm modal
+    document.getElementById('cf-close').addEventListener('click', () => { closeModal('cf-ov'); resetCfModal(); });
+    document.getElementById('cf-cancel').addEventListener('click', () => { closeModal('cf-ov'); resetCfModal(); });
+    document.getElementById('cf-back').addEventListener('click', () => this.backToResults());
+    document.getElementById('cf-add').addEventListener('click', () => this.confirmAdd());
+
+    // Search progress cancel
+    document.getElementById('srch-progress-backdrop').addEventListener('click', () => this.cancelSearch());
+    document.getElementById('sp-cancel').addEventListener('click', () => this.cancelSearch());
+  },
+
+  async loadSet() {
+    const s = await DB.getSetting('settings');
+    if (s) Object.assign(this.set, s);
+  },
+  saveSet() {
+    this.set.token = document.getElementById('tk').value.trim();
+    this.set.shopName = document.getElementById('shopn').value.trim();
+    this.set.cond = document.getElementById('cond').value.trim() || 'VG+';
+    DB.setSetting('settings', { ...this.set });
+  },
+  saveSetConfirm() {
+    this.saveSet();
+    const notice = document.getElementById('tk-saved');
+    notice.style.display = 'block';
+    clearTimeout(this._tkT);
+    this._tkT = setTimeout(() => notice.style.display = 'none', 2500);
+    toast('Token saved ✓');
+  },
+
+  async refresh() {
+    const all = await DB.all();
+    all.sort((a, b) => (b.added_date || '').localeCompare(a.added_date || ''));
+    this.recs = all;
+    document.getElementById('cnt').textContent = `${all.length} record${all.length !== 1 ? 's' : ''}`;
+    const genres = [...new Set(all.flatMap(r => r.genres || []))];
+    const total = all.reduce((s, r) => s + (r.sell_price || 0), 0);
+    document.getElementById('s-tot').textContent = all.length;
+    document.getElementById('s-gen').textContent = genres.length;
+    document.getElementById('s-val').textContent = `$${Math.round(total)}`;
+    this.renderRecent(all.slice(0, 8));
+    this.renderChips(genres.sort());
+    if (this.view === 'inv') this.filter();
+  },
+
+  renderRecent(recs) {
+    const el = document.getElementById('recent');
+    if (!recs.length) {
+      el.innerHTML = `<div class="empty"><div class="empty-ico">🎵</div><div class="empty-ttl">No records yet</div><div class="empty-sub">Tap the mic and speak an artist &amp; record name</div></div>`;
+      return;
+    }
+    el.innerHTML = recs.map(r => {
+      const px = r.sell_price != null ? sellFmt(r.sell_price) : '';
+      const tags = (r.genres || []).slice(0, 3).map(g => `<span class="tag tag-g">${esc(g)}</span>`).join('');
+      return `<div class="ri" data-id="${r.id}">
+        ${imgEl(r.cover_image, 'ri-img', r.title)}
+        <div class="ri-meta">
+          <div class="ri-art">${esc(r.artist)}</div>
+          <div class="ri-ttl">${esc(r.title)}</div>
+          ${tags ? `<div class="ri-tags">${tags}</div>` : ''}
+        </div>
+        ${px ? `<span class="ri-px">${esc(px)}</span>` : ''}
+      </div>`;
+    }).join('');
+    el.querySelectorAll('.ri').forEach(el => {
+      el.addEventListener('click', () => this.detail(el.dataset.id));
+    });
+  },
+
+  renderChips(genres) {
+    const el = document.getElementById('gchips');
+    el.innerHTML = `<div class="chip${!this.genreF ? ' on' : ''}" data-genre="">All</div>` +
+      genres.map(g => `<div class="chip${this.genreF === g ? ' on' : ''}" data-genre="${esc(g)}">${esc(g)}</div>`).join('');
+    el.querySelectorAll('.chip').forEach(chip => {
+      chip.addEventListener('click', () => this.setGenre(chip.dataset.genre));
+    });
+  },
+
+  setGenre(g) {
+    this.genreF = g;
+    this.renderChips([...new Set(this.recs.flatMap(r => r.genres || []))].sort());
+    this.filter();
+  },
+
+  filter() {
+    const q = document.getElementById('inv-q').value.toLowerCase();
+    let r = this.recs;
+    if (q) r = r.filter(x =>
+      x.artist?.toLowerCase().includes(q) ||
+      x.title?.toLowerCase().includes(q) ||
+      x.label?.toLowerCase().includes(q) ||
+      x.cat_no?.toLowerCase().includes(q)
+    );
+    if (this.genreF) r = r.filter(x => (x.genres || []).includes(this.genreF));
+    this.filtered = r;
+    this.page = 0;
+    this.renderInv(r.slice(0, this.PAGE), false);
+    if (r.length > this.PAGE) {
+      const btn = document.createElement('button');
+      btn.className = 'more-btn';
+      btn.textContent = `Load more — ${r.length - this.PAGE} remaining`;
+      btn.addEventListener('click', () => this.more());
+      document.getElementById('inv-list').appendChild(btn);
+    }
+  },
+
+  more() {
+    this.page++;
+    const s = this.page * this.PAGE;
+    const chunk = this.filtered.slice(s, s + this.PAGE);
+    const oldBtn = document.querySelector('.more-btn');
+    if (oldBtn) oldBtn.remove();
+    this.renderInv(chunk, true);
+    if (s + this.PAGE < this.filtered.length) {
+      const btn = document.createElement('button');
+      btn.className = 'more-btn';
+      btn.textContent = `Load more — ${this.filtered.length - s - this.PAGE} remaining`;
+      btn.addEventListener('click', () => this.more());
+      document.getElementById('inv-list').appendChild(btn);
+    }
+  },
+
+  renderInv(recs, append) {
+    const el = document.getElementById('inv-list');
+    if (!recs.length && !append) {
+      el.innerHTML = `<div class="empty"><div class="empty-ico">📦</div><div class="empty-ttl">Nothing found</div><div class="empty-sub">Try a different search or genre filter</div></div>`;
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    recs.forEach(r => {
+      const sp = r.sell_price != null ? sellFmt(r.sell_price) : '—';
+      const mp = r.lowest_price != null ? `<span class="rc-med">low ${medFmt(r.lowest_price)}</span>` : '';
+      const tags = (r.genres || []).slice(0, 3).map(g => `<span class="tag tag-g">${esc(g)}</span>`).join('');
+      const fmt = r.format?.split(' — ')[0];
+      const div = document.createElement('div');
+      div.className = 'rc';
+      div.dataset.id = r.id;
+      div.innerHTML = `${imgEl(r.cover_image, 'rc-img', r.title)}
+        <div class="rc-meta">
+          <div class="rc-art">${esc(r.artist)}</div>
+          <div class="rc-ttl">${esc(r.title)}</div>
+          <div class="rc-lbl">${esc([r.label, r.cat_no].filter(Boolean).join(' · '))}</div>
+          <div class="rc-tags">${tags}${fmt ? `<span class="tag tag-f">${esc(fmt)}</span>` : ''}</div>
+        </div>
+        <div class="rc-r"><span class="rc-px">${esc(sp)}</span>${mp}<span class="rc-yr">${esc(String(r.year || ''))}</span></div>`;
+      div.addEventListener('click', () => this.detail(r.id));
+      frag.appendChild(div);
+    });
+    if (append) el.appendChild(frag);
+    else { el.innerHTML = ''; el.appendChild(frag); }
+  },
+
+  nav(v) {
+    this.view = v;
+    document.querySelectorAll('.view').forEach(x => x.classList.remove('on'));
+    document.querySelectorAll('.nb').forEach(x => x.classList.remove('on'));
+    document.getElementById(`v-${v}`).classList.add('on');
+    document.querySelector(`[data-v="${v}"]`).classList.add('on');
+    if (v === 'inv') this.filter();
+  },
+
+  async search(q) {
+    q = q.trim(); if (!q) return;
+    if (this._searching) return;
+    this._searching = true;
+    this.lastQuery = q;
+    ['micBtnCat','micBtnSearch'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = true; });
+    showDisc(true); setTx('Searching Discogs…', false);
+    try {
+      let { results, usedQuery } = await Discogs.searchWithFallback(q);
+      // If no results, try homophone variants
+      if (!results.length) {
+        const hv = homophoneVariants(q);
+        for (const hq of hv) {
+          if (_searchAbort) break;
+          const hr = await Discogs.searchWithFallback(hq);
+          if (hr.results.length) { results = hr.results; usedQuery = hq; break; }
+        }
+      }
+      this.cache = results;
+      showDisc(false);
+      const refine = document.getElementById('res-refine');
+      refine.value = usedQuery || q;
+      const didYouMean = (usedQuery && usedQuery.toLowerCase() !== q.toLowerCase())
+        ? `<div style="font-size:11px;color:var(--yellow);padding:6px 20px 0;letter-spacing:.5px">🔄 Searched for: <strong>${esc(usedQuery)}</strong></div>`
+        : '';
+      if (!results.length) {
+        setTx(q, false);
+        document.getElementById('res-ttl').textContent = 'No results — edit and search';
+        document.getElementById('res-body').innerHTML = `${didYouMean}<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">Nothing found for "${esc(q)}"</div><div class="empty-sub">Edit the search above — try just the artist name, or check the spelling</div></div>`;
+        openModal('res-ov');
+        setTimeout(() => refine.focus(), 320);
+        return;
+      }
+      setTx(q, 'results');
+      this.renderResults(results, q, false, didYouMean);
+      openModal('res-ov');
+    } catch (e) {
+      showDisc(false);
+      setTx('Search failed — check connection', false);
+      toast('Search failed: ' + e.message, 'er');
+    } finally {
+      this._searching = false;
+      ['micBtnCat','micBtnSearch'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = false; });
+    }
+  },
+
+  /** Cat# / Matrix-number only search — fast, no text fallback */
+  async searchCatNo(q) {
+    q = q.trim(); if (!q) return;
+    if (this._searching) return;
+    this._searching = true;
+    this.lastQuery = q;
+    ['micBtnCat','micBtnSearch'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = true; });
+    showDisc(true); setTx('Cat# search…', false);
+    const tryQ = async url => {
+      if (_searchAbort) return [];
+      return Discogs.rawGet(url).then(d => d.results || []).catch(() => []);
+    };
+    try {
+      progShow();
+      const cats = [...new Set([
+        q.replace(/\s+/g,'').toUpperCase(),
+        q,
+        ...catVariants(q),
+      ])];
+      let results = [];
+      let usedCat = null;
+      for (const cat of cats) {
+        if (_searchAbort) break;
+        progStep(1, `Cat# "${cat}"…`);
+        const r = await tryQ(`/database/search?catno=${encodeURIComponent(cat)}&type=release&per_page=15&format=vinyl`);
+        if (r.length) { results = r; usedCat = cat; break; }
+      }
+      progHide();
+      this.cache = results;
+      showDisc(false);
+      const refine = document.getElementById('res-refine');
+      refine.value = usedCat || q;
+      if (!results.length) {
+        setTx(q, false);
+        document.getElementById('res-ttl').textContent = 'No Cat# match — try Artist/Track search';
+        document.getElementById('res-body').innerHTML = `<div class="empty"><div class="empty-ico">🏷️</div><div class="empty-ttl">No Cat# found for "${esc(q)}"</div><div class="empty-sub">Try the Artist/Track mic button instead</div></div>`;
+        openModal('res-ov');
+        return;
+      }
+      const dym = usedCat && usedCat !== q ? `<div style="font-size:11px;color:var(--yellow);padding:6px 20px 0">🏷️ Cat# matched: <strong>${esc(usedCat)}</strong></div>` : '';
+      setTx(q, 'results');
+      this.renderResults(results, usedCat || q, false, dym);
+      openModal('res-ov');
+    } catch (e) {
+      progHide(); showDisc(false);
+      setTx('Search failed — check connection', false);
+      toast('Search failed: ' + e.message, 'er');
+    } finally {
+      this._searching = false;
+      ['micBtnCat','micBtnSearch'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = false; });
+    }
+  },
+
+  reopenResults() {
+    if (!this.cache || !this.cache.length) {
+      if (this.lastQuery) this.search(this.lastQuery);
+      return;
+    }
+    const q = document.getElementById('res-refine').value || this.lastQuery || 'Results';
+    this.renderResults(this.cache, q);
+    openModal('res-ov');
+  },
+
+  async refineSearch(q) {
+    q = q.trim(); if (!q) return;
+    document.getElementById('res-refine').value = q;
+    const body = document.getElementById('res-body');
+    body.innerHTML = `<div class="ld"><div class="spin"></div> Searching…</div>`;
+    try {
+      const { results, usedQuery } = await Discogs.searchWithFallback(q);
+      this.cache = results;
+      const label = usedQuery && usedQuery.toLowerCase() !== q.toLowerCase() ? `"${usedQuery}"` : `"${q}"`;
+      document.getElementById('res-ttl').textContent = `${label} — ${results.length} result${results.length !== 1 ? 's' : ''}`;
+      const dym = usedQuery && usedQuery.toLowerCase() !== q.toLowerCase()
+        ? `<div style="font-size:11px;color:var(--yellow);padding:6px 20px 0;letter-spacing:.5px">🔄 Searched for: <strong>${esc(usedQuery)}</strong></div>` : '';
+      if (!results.length) {
+        body.innerHTML = dym + `<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No results for "${esc(q)}"</div><div class="empty-sub">Try just the artist name, or a single keyword</div></div>`;
+        return;
+      }
+      this.renderResults(results, q, false, dym);
+    } catch (e) {
+      body.innerHTML = `<div class="empty"><div class="empty-ico">📡</div><div class="empty-ttl">Search failed</div><div class="empty-sub">Check connection and try again</div></div>`;
+    }
+  },
+
+  scoreResult(r, q) {
+    const qClean = q.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+    const qWords = qClean.split(/\s+/).filter(w => w.length > 0);
+    const haystack = `${r.artist || ''} ${r.title || ''} ${(r.label || []).join(' ')} ${r.catno || ''} ${r.country || ''} ${r.year || ''}`.toLowerCase().replace(/[^a-z0-9\s]/g, '');
+    const hWords = haystack.split(/\s+/);
+    let bestRun = 0;
+    for (let hi = 0; hi < hWords.length; hi++) {
+      let run = 0, qi = 0;
+      for (let h2 = hi; h2 < hWords.length && qi < qWords.length; h2++) {
+        if (hWords[h2] === qWords[qi] || hWords[h2].includes(qWords[qi]) || qWords[qi].includes(hWords[h2])) { run++; qi++; } else break;
+      }
+      if (run > bestRun) bestRun = run;
+    }
+    const anywhereCount = qWords.filter(w => haystack.includes(w)).length;
+    const catno = (r.catno || '').toLowerCase().replace(/[-\s]/g, '');
+    const qCat = qClean.replace(/\s/g, '');
+    const catBonus = (catno && (qCat.includes(catno) || catno.includes(qCat))) ? 50 : 0;
+    return (bestRun * 20) + (anywhereCount * 3) + catBonus;
+  },
+
+  cancelSearch() {
+    _searchAbort = true;
+    this._searching = false;
+    progHide();
+    showDisc(false);
+    setTx('Search cancelled', false);
+    const mic = document.getElementById('micBtn');
+    if (mic) mic.disabled = false;
+  },
+
+  filterResults(val) {
+    val = val.trim();
+    if (!val) { this.renderResults(this.cache, this._lastQ || 'Results'); return; }
+    const v = val.toLowerCase();
+    const words = v.split(/\s+/);
+    const filtered = this.cache.filter(r => {
+      const h = `${r.artist || ''} ${r.title || ''} ${(r.label || []).join(' ')} ${r.catno || ''} ${r.country || ''} ${r.year || ''}`.toLowerCase();
+      return words.every(w => h.includes(w));
+    });
+    filtered.sort((a, b) => this.scoreResult(b, val) - this.scoreResult(a, val));
+    const ttl = document.getElementById('res-ttl');
+    ttl.textContent = filtered.length ? `${filtered.length} of ${this.cache.length} pressings` : `No matches — ${this.cache.length} total`;
+    const body = document.getElementById('res-body');
+    if (!filtered.length) {
+      body.innerHTML = `<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No local matches for "${esc(val)}"</div><div class="empty-sub">Edit the top bar and press Go to search Discogs</div></div>`;
+    } else {
+      body.innerHTML = '';
+      filtered.forEach(r => {
+        const ci = this.cache.indexOf(r);
+        this._appendResult(body, r, ci, false);
+      });
+      body.scrollTop = 0;
+    }
+  },
+
+  resMic() {
+    closeModal('res-ov');
+    setTimeout(() => Voice.toggle(), 150);
+  },
+
+  _appendResult(container, r, ci, showBack) {
+    const parts = r.title ? r.title.split(' - ') : ['?'];
+    const artist = parts[0];
+    const title = parts.slice(1).join(' - ') || parts[0];
+    const det = [r.label?.[0], r.catno, r.country, r.year].filter(Boolean).join(' · ');
+    const fmt = r.format ? r.format.join(', ') : '';
+    const div = document.createElement('div');
+    div.className = 'result';
+    div.innerHTML = `${imgEl(r.thumb || r.cover_image, 'res-img', title)}
+      <div style="flex:1;min-width:0">
+        <div class="res-art res-art-tap" data-artist="${esc(artist)}" title="Tap to see all releases by this artist">${esc(artist)} <span style="color:var(--red);font-size:10px">▼ all releases</span></div>
+        <div class="res-ttl">${esc(title)}</div>
+        <div class="res-det">${esc(det)}</div>
+        ${fmt ? `<div class="res-fmt">${esc(fmt)}</div>` : ''}
+      </div>`;
+    div.addEventListener('click', e => {
+      if (e.target.closest('.res-art-tap')) return;
+      this.pick(ci);
+    });
+    div.querySelector('.res-art-tap').addEventListener('click', e => {
+      e.stopPropagation();
+      this.browseArtist(artist);
+    });
+    container.appendChild(div);
+  },
+
+  renderResults(res, q, showBack, didYouMean = '') {
+    this._lastQ = q;
+    const fbar = document.getElementById('res-filter');
+    if (fbar) fbar.value = '';
+    const sorted = [...res].sort((a, b) => this.scoreResult(b, q) - this.scoreResult(a, q));
+    document.getElementById('res-ttl').textContent = `"${q}" — ${sorted.length} pressings`;
+    const body = document.getElementById('res-body');
+    body.innerHTML = '';
+    if (didYouMean) { const d = document.createElement('div'); d.innerHTML = didYouMean; body.appendChild(d.firstElementChild); }
+    if (showBack) {
+      const backDiv = document.createElement('div');
+      backDiv.style.cssText = 'padding:9px 20px;border-bottom:1px solid var(--border)';
+      const backBtn = document.createElement('button');
+      backBtn.style.cssText = 'background:none;border:none;color:var(--red);font-size:13px;cursor:pointer;padding:0';
+      backBtn.textContent = '← Back to original results';
+      backBtn.addEventListener('click', () => this.restoreCache());
+      backDiv.appendChild(backBtn);
+      body.appendChild(backDiv);
+    }
+    if (sorted.length) {
+      sorted.forEach((r, i) => { const ci = res.indexOf(r); this._appendResult(body, r, ci, showBack); });
+    } else {
+      body.innerHTML += `<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No results</div><div class="empty-sub">Try rephrasing artist or title</div></div>`;
+    }
+    body.scrollTop = 0;
+  },
+
+  _prevCache: [], _prevQ: '',
+
+  async browseArtist(artist) {
+    this._prevCache = [...this.cache];
+    this._prevQ = document.getElementById('res-ttl').textContent;
+    const body = document.getElementById('res-body');
+    body.innerHTML = `<div class="ld"><div class="spin"></div> Loading all releases by ${esc(artist)}…</div>`;
+    document.getElementById('res-ttl').textContent = `All releases: ${artist}`;
+    try {
+      const results = await Discogs.searchArtist(artist);
+      this.cache = results;
+      this.renderResults(results, artist, true);
+    } catch (e) {
+      body.innerHTML = `<div class="empty"><div class="empty-ico">📡</div><div class="empty-ttl">Failed to load</div><div class="empty-sub">Check your connection</div></div>`;
+    }
+  },
+
+  restoreCache() {
+    this.cache = this._prevCache;
+    document.getElementById('res-ttl').textContent = this._prevQ;
+    const parts = this._prevQ.replace(/"/g, '').split(' — ')[0];
+    this.renderResults(this._prevCache, parts, false);
+  },
+
+  async pick(i) {
+    closeModal('res-ov');
+    const hit = this.cache[i]; if (!hit) return;
+    showDisc(true); setTx('Fetching release details…', false);
+    try {
+      const [relR, statR] = await Promise.allSettled([
+        Discogs.release(hit.id),
+        Discogs.stats(hit.id)
+      ]);
+      const rel = relR.status === 'fulfilled' ? relR.value : { ...hit };
+      const stat = statR.status === 'fulfilled' ? statR.value : null;
+      showDisc(false);
+      this.buildPending(rel, stat);
+      document.getElementById('cf-back').style.display = '';
+      openModal('cf-ov');
+    } catch (e) {
+      showDisc(false);
+      this.buildPending({ ...hit }, null);
+      document.getElementById('cf-back').style.display = '';
+      openModal('cf-ov');
+    }
+  },
+
+  backToResults() {
+    closeModal('cf-ov');
+    resetCfModal();
+    this.pending = null;
+    openModal('res-ov');
+    const q = document.getElementById('res-refine').value || 'Results';
+    this.renderResults(this.cache, q);
+  },
+
+  buildPending(rel, stat) {
+    const artist = (rel.artists_sort || rel.artists?.[0]?.name ||
+      rel.title?.split(' - ')[0] || 'Unknown').replace(/\s*\(\d+\)$/, '');
+    const title = rel.title ? (rel.artists ? rel.title : rel.title.split(' - ').slice(1).join(' - ') || rel.title) : rel.title || 'Unknown';
+    const label = rel.labels?.[0]?.name || rel.label?.[0] || '';
+    const catno = rel.labels?.[0]?.catno || rel.catno || '';
+    const year = rel.year || rel.released_formatted?.slice(0, 4) || '';
+    const country = rel.country || '';
+    const fmt = (rel.formats?.[0]?.name || rel.format?.[0] || 'Vinyl') +
+      (rel.formats?.[0]?.descriptions?.length ? ' — ' + rel.formats[0].descriptions.join(', ') : '');
+    const rawGenres = rel.genres || rel.genre || [];
+    const rawStyles = rel.styles || rel.style || [];
+    const genres = mapGenres(
+      Array.isArray(rawGenres) ? rawGenres : [rawGenres],
+      Array.isArray(rawStyles) ? rawStyles : [rawStyles]
+    );
+    let basePx = null;
+    if (stat?.lowest_price?.value != null) basePx = parseFloat(stat.lowest_price.value);
+    else if (rel.lowest_price != null) basePx = parseFloat(rel.lowest_price);
+    const sellPx = basePx != null ? Math.ceil(basePx * 2) : null;
+    const img = rel.images?.[0]?.uri || rel.thumb || rel.cover_image || '';
+    const tracks = (rel.tracklist || []).slice(0, 24);
+    this.pending = {
+      id: uid(),
+      discogs_id: rel.id,
+      artist, title, label, cat_no: catno,
+      year: parseInt(year) || null, country,
+      format: fmt, genres,
+      styles: Array.isArray(rawStyles) ? rawStyles : [rawStyles],
+      tracklist: tracks.map(t => `${t.position} ${t.title}`).join('\n'),
+      cover_image: img,
+      discogs_url: `https://www.discogs.com/release/${rel.id}`,
+      lowest_price: basePx,
+      sell_price: sellPx,
+      num_for_sale: stat?.num_for_sale ?? rel.num_for_sale ?? null,
+      added_date: new Date().toISOString(),
+      status: 'active', notes: ''
+    };
+    const allTags = [...new Set([
+      ...genres,
+      ...(Array.isArray(rawStyles) ? rawStyles : [rawStyles]).filter(Boolean)
+    ])];
+    this.pending.genres = allTags;
+    const hasPrice = basePx != null;
+    const medDisplay = hasPrice ? medFmt(basePx) : 'No Data';
+    const sellDisplay = hasPrice ? sellFmt(sellPx) : '—';
+    const priceSrc = hasPrice ? 'Lowest Listed' : 'No Market Data';
+    document.getElementById('cf-body').innerHTML = `
+      ${img ? `<img class="cf-cover" src="${esc(img)}" alt="${esc(title)}" onerror="this.style.display='none'">` : ''}
+      <div class="cf-inner">
+        <div class="cf-art">${esc(artist)}</div>
+        <div class="cf-ttl">${esc(title)}</div>
+        <div class="info-grid">
+          <div class="ii"><label>Label</label><span>${esc(label || '—')}</span></div>
+          <div class="ii"><label>Cat#</label><span>${esc(catno || '—')}</span></div>
+          <div class="ii"><label>Year</label><span>${esc(String(year || '—'))}</span></div>
+          <div class="ii"><label>Country</label><span>${esc(country || '—')}</span></div>
+          <div class="ii"><label>Format</label><span>${esc(fmt.split(' — ')[0])}</span></div>
+          ${this.pending.num_for_sale != null ? `<div class="ii"><label>For Sale</label><span>${this.pending.num_for_sale} copies</span></div>` : ''}
+        </div>
+        <div class="price-box">
+          <div class="price-row">
+            <div class="price-col">
+              <div class="price-lbl">${esc(priceSrc)}</div>
+              <div class="price-val med">${esc(medDisplay)}</div>
+            </div>
+            <div class="price-arrow">×2 ↗</div>
+            <div class="price-col">
+              <div class="price-lbl">Your Listing Price</div>
+              <div class="price-val sell">${esc(sellDisplay)}</div>
+            </div>
+          </div>
+          ${hasPrice ? `<div class="price-note">Rounded up to nearest $1 · Edit after adding if needed</div>` : '<div class="price-note warn">⚠ No marketplace data — price manually after adding</div>'}
+        </div>
+        <div class="field-lbl">Genres &amp; Styles</div>
+        <div class="genre-row" id="gpr">
+          ${allTags.map(g => `<span class="gp on">${esc(g)}</span>`).join('')}
+        </div>
+        <div class="field-lbl">Notes (condition, flaws, pressing info…)</div>
+        <input class="field" id="cf-notes" placeholder="e.g. VG+ vinyl, slight scuff side B, original UK press">
+        ${tracks.length ? `
+        <div class="tracklist" style="margin-top:10px">
+          <div class="tl-hd">Tracklist</div>
+          ${tracks.map(t => `<div class="tr">
+            <span class="tr-pos">${esc(t.position)}</span>
+            <span class="tr-nm">${esc(t.title)}</span>
+            ${t.duration ? `<span class="tr-dur">${esc(t.duration)}</span>` : ''}
+          </div>`).join('')}
+        </div>` : ''}
+      </div>`;
+  },
+
+  async confirmAdd() {
+    if (!this.pending) return;
+    const notes = document.getElementById('cf-notes');
+    if (notes) this.pending.notes = notes.value.trim();
+    const dup = this.recs.find(r => r.discogs_id && r.discogs_id === this.pending.discogs_id);
+    if (dup && !confirm(`"${this.pending.artist} – ${this.pending.title}" is already in your catalog (added ${dup.added_date?.slice(0, 10)}). Add again?`)) return;
+    try {
+      await DB.put(this.pending);
+      closeModal('cf-ov'); resetCfModal();
+      toast(`Added: ${this.pending.artist} — ${this.pending.title}`);
+      // Auto-clear all search inputs after adding
+      const hs = document.getElementById('home-search');
+      if (hs) hs.value = '';
+      const rr = document.getElementById('res-refine');
+      if (rr) rr.value = '';
+      setTx('Ready to listen…', false);
+      this.pending = null;
+      await this.refresh();
+    } catch (e) {
+      toast('Save failed: ' + e.message, 'er');
+    }
+  },
+
+  async detail(id) {
+    const r = this.recs.find(x => x.id === id); if (!r) return;
+    const sp = r.sell_price != null ? sellFmt(r.sell_price) : '—';
+    const mp = r.lowest_price != null ? medFmt(r.lowest_price) : '—';
+    document.getElementById('cf-title').textContent = 'Record Details';
+    document.getElementById('cf-foot').style.display = 'none';
+    document.getElementById('cf-body').innerHTML = `
+      ${imgEl(r.cover_image, 'cf-cover', r.title)}
+      <div class="cf-inner">
+        <div class="cf-art">${esc(r.artist)}</div>
+        <div class="cf-ttl">${esc(r.title)}</div>
+        <div class="info-grid">
+          <div class="ii"><label>Label</label><span>${esc(r.label || '—')}</span></div>
+          <div class="ii"><label>Cat#</label><span>${esc(r.cat_no || '—')}</span></div>
+          <div class="ii"><label>Year</label><span>${esc(String(r.year || '—'))}</span></div>
+          <div class="ii"><label>Country</label><span>${esc(r.country || '—')}</span></div>
+          <div class="ii"><label>Format</label><span>${esc(r.format?.split(' — ')[0] || '—')}</span></div>
+        </div>
+        <div class="price-box">
+          <div class="price-row">
+            <div class="price-col"><div class="price-lbl">Lowest Listed</div><div class="price-val med">${esc(mp)}</div></div>
+            <div class="price-arrow">×2 ↗</div>
+            <div class="price-col"><div class="price-lbl">Your Price</div><div class="price-val sell">${esc(sp)}</div></div>
+          </div>
+        </div>
+        <div class="genre-row">${(r.genres || []).map(g => `<span class="gp on">${esc(g)}</span>`).join('')}</div>
+        <div style="margin:12px 0 4px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--t2)">Notes</div>
+        <textarea id="det-notes" rows="3"
+          style="width:100%;background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:13px;font-family:var(--sans);line-height:1.5;resize:none"
+          placeholder="Condition, pressing info, flaws…"
+          data-record-id="${r.id}"
+        >${esc(r.notes || '')}</textarea>
+        <div id="det-notes-status" style="font-size:11px;color:var(--green);height:16px;margin-bottom:6px;text-align:right"></div>
+        ${r.tracklist ? `<div class="tracklist"><div class="tl-hd">Tracklist</div>${r.tracklist.split('\n').map(t => `<div class="tr"><span class="tr-nm">${esc(t)}</span></div>`).join('')}</div>` : ''}
+        <div style="display:flex;gap:8px;margin-top:14px">
+          ${r.discogs_url ? `<a href="${esc(r.discogs_url)}" target="_blank" rel="noopener" style="flex:1;text-align:center;padding:10px;background:var(--s2);border:1px solid var(--border);border-radius:8px;color:var(--t2);font-size:13px;text-decoration:none">View on Discogs ↗</a>` : ''}
+          <button class="det-del-btn" data-del-id="${r.id}" style="padding:10px 16px;background:none;border:1px solid var(--red);border-radius:8px;color:var(--red);font-size:13px;cursor:pointer">Delete</button>
+        </div>
+      </div>`;
+    // Wire up events in detail modal
+    const textarea = document.getElementById('det-notes');
+    if (textarea) {
+      textarea.addEventListener('blur', () => this.saveNotes(r.id, textarea.value));
+    }
+    document.querySelector('.det-del-btn')?.addEventListener('click', () => this.del(r.id));
+    openModal('cf-ov');
+  },
+
+  async saveNotes(id, val) {
+    const r = this.recs.find(x => x.id === id); if (!r) return;
+    r.notes = val.trim();
+    await DB.put(r);
+    const status = document.getElementById('det-notes-status');
+    if (status) { status.textContent = '✓ Saved'; setTimeout(() => { if (status) status.textContent = ''; }, 2000); }
+    this.recs = await DB.all();
+  },
+
+  async del(id) {
+    if (!confirm('Remove this record from your catalog?')) return;
+    await DB.del(id);
+    closeModal('cf-ov'); resetCfModal();
+    toast('Record removed');
+    await this.refresh();
+  },
+
+  logoRefresh() {
+    const btn = document.getElementById('logo-btn');
+    btn.classList.add('spinning');
+    setTimeout(() => btn.classList.remove('spinning'), 420);
+    this.refresh();
+    toast('Refreshed');
+  },
+
+  clearAll() {
+    if (!confirm('Delete ALL records? This cannot be undone.')) return;
+    DB.all().then(recs => Promise.all(recs.map(r => DB.del(r.id)))).then(() => {
+      toast('All records cleared');
+      this.refresh();
+    });
+  }
+};
+
+// Boot — defer until DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => App.init().catch(e => console.error('VinylVault init error:', e)));
+} else {
+  App.init().catch(e => console.error('VinylVault init error:', e));
+}
+
+
 // ── PWA: Service Worker Registration ──
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
@@ -576,26 +1971,32 @@ let _deferredPrompt = null;
 window.addEventListener('beforeinstallprompt', e => {
   e.preventDefault();
   _deferredPrompt = e;
-  // Show install banner after a short delay
   setTimeout(() => {
-    document.getElementById('install-banner').classList.add('show');
+    const banner = document.getElementById('install-banner');
+    if (banner) banner.classList.add('show');
   }, 3000);
 });
 
-document.getElementById('ib-install').addEventListener('click', async () => {
-  if (!_deferredPrompt) return;
-  _deferredPrompt.prompt();
-  const { outcome } = await _deferredPrompt.userChoice;
-  _deferredPrompt = null;
-  document.getElementById('install-banner').classList.remove('show');
-});
-
-document.getElementById('ib-later').addEventListener('click', () => {
-  document.getElementById('install-banner').classList.remove('show');
+window.addEventListener('DOMContentLoaded', () => {
+  const ibInstall = document.getElementById('ib-install');
+  const ibLater = document.getElementById('ib-later');
+  if (ibInstall) ibInstall.addEventListener('click', async () => {
+    if (!_deferredPrompt) return;
+    _deferredPrompt.prompt();
+    await _deferredPrompt.userChoice;
+    _deferredPrompt = null;
+    const banner = document.getElementById('install-banner');
+    if (banner) banner.classList.remove('show');
+  });
+  if (ibLater) ibLater.addEventListener('click', () => {
+    const banner = document.getElementById('install-banner');
+    if (banner) banner.classList.remove('show');
+  });
 });
 
 window.addEventListener('appinstalled', () => {
-  document.getElementById('install-banner').classList.remove('show');
+  const banner = document.getElementById('install-banner');
+  if (banner) banner.classList.remove('show');
   _deferredPrompt = null;
 });
 
@@ -603,8 +2004,10 @@ window.addEventListener('appinstalled', () => {
 window.addEventListener('load', () => {
   setTimeout(() => {
     const splash = document.getElementById('splash');
-    splash.classList.add('hide');
-    setTimeout(() => splash.remove(), 500);
+    if (splash) {
+      splash.classList.add('hide');
+      setTimeout(() => { if (splash.parentNode) splash.remove(); }, 500);
+    }
   }, 800);
 });
 </script>
